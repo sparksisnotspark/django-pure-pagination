@@ -1,8 +1,8 @@
 import collections
-
+import collections.abc
 from django.core.paginator import InvalidPage, EmptyPage, PageNotAnInteger
 from django.conf import settings
-
+from django.core.paginator import Paginator
 from math import ceil
 import functools
 
@@ -64,6 +64,7 @@ class Paginator(object):
                 # (i.e. is of type list).
                 self._count = len(self.object_list)
         return self._count
+
     count = property(_get_count)
 
     def _get_num_pages(self):
@@ -75,6 +76,7 @@ class Paginator(object):
                 hits = max(1, self.count - self.orphans)
                 self._num_pages = int(ceil(hits / float(self.per_page)))
         return self._num_pages
+
     num_pages = property(_get_num_pages)
 
     def _get_page_range(self):
@@ -83,7 +85,9 @@ class Paginator(object):
         a template for loop.
         """
         return range(1, self.num_pages + 1)
+
     page_range = property(_get_page_range)
+
 
 QuerySetPaginator = Paginator  # For backwards-compatibility.
 
@@ -116,7 +120,7 @@ def add_page_querystring(func):
     return wrapper
 
 
-class Page(object):
+class Page(collections.abc.Sequence):
     def __init__(self, object_list, number, paginator):
         self.object_list = object_list
         self.paginator = paginator
@@ -127,6 +131,18 @@ class Page(object):
             # self.base_queryset = self.base_queryset.urlencode().replace('%', '%%').replace('page=page', 'page=%s')
 
         self.number = PageRepresentation(number, self._other_page_querystring(number))
+
+    def __len__(self):
+        return len(self.object_list)
+
+    def __getitem__(self, index):
+        if not isinstance(index, (int, slice)):
+            raise TypeError
+        # The object_list is converted to a list so that if it was a QuerySet
+        # it won't be a database hit per __getitem__.
+        if not isinstance(self.object_list, list):
+            self.object_list = list(self.object_list)
+        return self.object_list[index]
 
     def __repr__(self):
         return '<Page %s of %s>' % (self.number, self.paginator.num_pages)
@@ -212,5 +228,154 @@ class Page(object):
         return render_to_string('pure_pagination/pagination.html', {
             'current_page': self,
             'page_obj': self,  # Issue 9 https://github.com/jamespacileo/django-pure-pagination/issues/9
-                               # Use same naming conventions as Django
+            # Use same naming conventions as Django
+        })
+
+
+class ApiPaginator(object):
+
+    def __init__(self, total=100, per_page=20, orphans=0, allow_empty_first_page=True, request=None):
+        self.per_page = per_page
+        self.total = total
+        self.orphans = orphans
+        self.request = request
+        self.allow_empty_first_page = True
+        self._num_pages = self._count = None
+
+    def validate_number(self, number):
+        try:
+            number = int(number)
+        except ValueError:
+            raise PageNotAnInteger('the page number is not a int page')
+        if number < 1:
+            if SHOW_FIRST_PAGE_WHEN_INVALID:
+                number = 1
+            else:
+                raise EmptyPage('the page number less then 1')
+        if number > self.num_pages:
+            if number == 1 and self.allow_empty_first_page:
+                pass
+            elif SHOW_FIRST_PAGE_WHEN_INVALID:
+                number = 1
+            else:
+                raise EmptyPage('the page contains no results')
+
+        return number
+
+    def page(self, number):
+        number = self.validate_number(number)
+        return ApiPage(number, self)
+
+    def _get_count(self):
+        return self.total
+
+    count = property(_get_count)
+
+    def _get_num_pages(self):
+        if self._num_pages is None:
+            if self.count == 0 and self.allow_empty_first_page:
+                self._num_pages = 0
+            else:
+                hits = max(1, (self.count - self.orphans))
+                self._num_pages = int(ceil(hits / float(self.per_page)))
+        return self._num_pages
+
+    num_pages = property(_get_num_pages)
+
+    def _get_page_range(self):
+        return range(1, self.num_pages + 1)
+
+    page_range = property(_get_page_range)
+
+
+class ApiPage(object):
+    def __init__(self, number, paginator):
+        self.paginator = paginator
+        if self.paginator.request:
+            self.base_queryset = self.paginator.request.GET.copy()
+
+        self.number = PageRepresentation(number, self._other_page_querystring(number))
+
+    def has_next(self):
+        return self.number < self.paginator.num_pages
+
+    def has_previous(self):
+        return self.number > 1
+
+    def has_other_pages(self):
+        return self.has_previous() or self.has_next()
+
+    @add_page_querystring
+    def next_page_number(self):
+        return self.number + 1
+
+    @add_page_querystring
+    def previous_page_number(self):
+        return self.number - 1
+
+    def start_index(self):
+        """
+        Returns the 1-based index of the first object on this page,
+        relative to total objects in the paginator.
+        """
+        # Special case, return zero if no items.
+        if self.paginator.count == 0:
+            return 0
+        return (self.paginator.per_page * (self.number - 1)) + 1
+
+    def end_index(self):
+        """
+        Returns the 1-based index of the last object on this page,
+        relative to total objects found (hits).
+        """
+        # Special case for the last page because there can be orphans.
+        if self.number == self.paginator.num_pages:
+            return self.paginator.count
+        return self.number * self.paginator.per_page
+
+    @add_page_querystring
+    def pages(self):
+        if self.paginator.num_pages <= PAGE_RANGE_DISPLAYED:
+            return range(1, self.paginator.num_pages + 1)
+        result = []
+        left_side = PAGE_RANGE_DISPLAYED / 2
+        right_side = PAGE_RANGE_DISPLAYED - left_side
+        if self.number > self.paginator.num_pages - PAGE_RANGE_DISPLAYED / 2:
+            right_side = self.paginator.num_pages - self.number
+            left_side = PAGE_RANGE_DISPLAYED - right_side
+        elif self.number < PAGE_RANGE_DISPLAYED / 2:
+            left_side = self.number
+            right_side = PAGE_RANGE_DISPLAYED - left_side
+        for page in range(1, self.paginator.num_pages + 1):
+            if page <= MARGIN_PAGES_DISPLAYED:
+                result.append(page)
+                continue
+            if page > self.paginator.num_pages - MARGIN_PAGES_DISPLAYED:
+                result.append(page)
+                continue
+            if (page >= self.number - left_side) and (page <= self.number + right_side):
+                result.append(page)
+                continue
+            if result[-1]:
+                result.append(None)
+
+        return result
+
+    def _other_page_querystring(self, page_number):
+        """
+        Returns a query string for the given page, preserving any
+        GET parameters present.
+        """
+        if self.paginator.request:
+            self.base_queryset['page'] = page_number
+            return self.base_queryset.urlencode()
+
+        # raise Warning("You must supply Paginator() with the request object for a proper querystring.")
+        return 'page=%s' % page_number
+
+    def render(self):
+        return render_to_string('pure_pagination/pagination.html', {
+            'current_page': self,
+            'page_obj': self,  # Issue 9 https://github.com/jamespacileo/django-pure-pagination/issues/9
+            # Use same naming conventions as Django
         })
